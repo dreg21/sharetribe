@@ -68,43 +68,27 @@ module TransactionService::Process
 
     def do_finalize_create(transaction_id, community_id)
       tx = TxStore.get_in_community(community_id: community_id, transaction_id: transaction_id)
-      gateway_adapter = TransactionService::Transaction.gateway_adapter(tx.payment_gateway)
 
       res =
         if tx.current_state == :preauthorized
           Result::Success.new()
         else
-          booking_res =
-            if tx.availability.to_sym == :booking && !tx.booking.valid?
-              void_payment(gateway_adapter, tx)
-              Result::Error.new(TransactionService::Transaction::BookingDatesInvalid.new(I18n.t("error_messages.booking.double_booking_payment_voided")))
-            else
-              Result::Success.new()
-            end
-
-          booking_res.on_success {
-            if tx.stripe_payments.last.try(:intent_requires_action?)
-              TransactionService::StateMachine.transition_to(tx.id, :payment_intent_requires_action)
-            else
-              TransactionService::StateMachine.transition_to(tx.id, :preauthorized)
-            end
-          }
+          new_state = tx.stripe_payments.last.try(:intent_requires_action?) ? :payment_intent_requires_action : :preauthorized
+          transition_tx = TransactionService::StateMachine.transition_to(tx.id, new_state)
+          if transition_tx && transition_tx.current_state.to_sym == new_state
+            Result::Success.new()
+          elsif transition_tx && transition_tx.booking && transition_tx.booking.errors.any?
+            Result::Error.new(
+              TransactionService::Transaction::BookingDatesInvalid.new(
+                I18n.t("error_messages.booking.double_booking_payment_voided")))
+          else
+            Result::Error.new('Generic payment error')
+          end
         end
 
       res.and_then {
         Result::Success.new(TransactionService::Transaction.create_transaction_response(tx))
       }
-    end
-
-    def void_payment(gateway_adapter, tx)
-      void_res = gateway_adapter.reject_payment(tx: tx, reason: "")[:response]
-
-      void_res.on_success {
-        logger.info("Payment voided after failed transaction", :void_payment, tx.slice(:community_id, :id))
-      }.on_error { |payment_error_msg, payment_data|
-        logger.error("Failed to void payment after failed booking", :failed_void_payment, tx.slice(:community_id, :id).merge(error_msg: payment_error_msg))
-      }
-      void_res
     end
 
     def reject(tx:, message:, sender_id:, gateway_adapter:)
